@@ -21,9 +21,9 @@ const app = express();
 
 // Enhanced CORS configuration
 const allowedOrigins = [
-  'https://yourusername.github.io', // Your GitHub Pages
+  'https://jobskenya.github.io/QUICK-CASH-frontend/', // Your GitHub Pages
   'http://localhost:3000',          // Local development
-  'https://your-custom-domain.com'  // If you have one
+  'https://jobskenya.github.io'  // If you have one
 ];
 
 const corsOptions = {
