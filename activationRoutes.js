@@ -1,25 +1,36 @@
 const express = require('express');
 const router = express.Router();
-const activationController = require('./activationController');
+const {
+  validateActivation,
+  initiateSTKPush,
+  handleMPesaCallback,
+  checkActivationStatus,
+  activateUser
+} = require('./activationController');
 const authMiddleware = require('./authMiddleware');
 
-// Add status check middleware
-router.use(authMiddleware);
-
-// Initiate activation payment
+// Protected routes
 router.post('/activate', 
-  activationController.validateActivation,
-  activationController.initiateSTKPush
+  authMiddleware,
+  validateActivation,
+  initiateSTKPush
 );
 
-// M-Pesa callback handler
+// Public callback (MPesa hits this directly)
 router.post('/mpesa-callback', 
-  activationController.verifyCallback,
-  activationController.handleMPesaCallback,
-  activationController.activateUser
+  handleMPesaCallback
 );
 
 // Check activation status
-router.get('/status', activationController.checkActivationStatus);
+router.get('/status', 
+  authMiddleware,
+  checkActivationStatus
+);
+
+// Manual activation (for testing)
+router.post('/manual-activate', 
+  authMiddleware,
+  activateUser
+);
 
 module.exports = router;
