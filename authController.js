@@ -3,109 +3,159 @@ const jwt = require('jsonwebtoken');
 const { v4: uuidv4 } = require('uuid');
 const userModel = require('./userModel');
 const balanceModel = require('./balanceModel');
-const transactionModel = require('./transactionModel');
 const jwtConfig = require('./jwtConfig');
-const { validateRegisterInput, validateLoginInput } = require('./validationMiddleware');
 
-const register = async (req, res, next) => {
+// Enhanced registration with proper error handling
+const register = async (req, res) => {
   try {
     const { name, phone, gender, password, referralCode } = req.body;
 
-    // Validate input
-    const { error } = validateRegisterInput(req.body);
-    if (error) return res.status(400).json({ message: error.details[0].message });
+    // Input validation
+    if (!name || !phone || !gender || !password) {
+      return res.status(400).json({ 
+        success: false,
+        message: 'All fields are required' 
+      });
+    }
 
-    // Check if user exists
-    const existingUser = await userModel.findUserByPhone(phone);
+    // Kenyan phone validation
+    if (!/^(\+?254|0)[17]\d{8}$/.test(phone)) {
+      return res.status(400).json({
+        success: false,
+        message: 'Invalid Kenyan phone number format'
+      });
+    }
+
+    // Standardize phone format (convert to 254)
+    const formattedPhone = phone.startsWith('0') ? `254${phone.substring(1)}` : phone;
+
+    // Check existing user
+    const existingUser = await userModel.findUserByPhone(formattedPhone);
     if (existingUser) {
-      return res.status(400).json({ message: 'Phone number already registered' });
+      return res.status(409).json({
+        success: false,
+        message: 'Phone number already registered'
+      });
     }
 
     // Hash password
     const salt = await bcrypt.genSalt(10);
     const passwordHash = await bcrypt.hash(password, salt);
 
-    // Generate referral code if not provided
-    const userReferralCode = referralCode || uuidv4().substring(0, 8).toUpperCase();
-
-    // Check if referral code is valid
-    let inviterPhone = null;
-    if (referralCode) {
-      const inviter = await userModel.findUserByReferralCode(referralCode);
-      if (!inviter) {
-        return res.status(400).json({ message: 'Invalid referral code' });
-      }
-      inviterPhone = inviter.phone;
-    }
-
     // Create user
     const user = await userModel.createUser({
       name,
-      phone,
+      phone: formattedPhone,
       gender,
       passwordHash,
-      referralCode: userReferralCode,
-      inviterPhone
+      referralCode: referralCode || uuidv4().substring(0, 8).toUpperCase(),
+      status: 'inactive' // Requires activation
     });
 
-    // Create balance record
+    // Create initial balance
     await balanceModel.createBalance(user.id);
 
-    // Generate token
-    const token = jwt.sign({ id: user.id }, jwtConfig.secret, { expiresIn: jwtConfig.expiresIn });
+    // Generate token (with user status)
+    const token = jwt.sign(
+      { 
+        id: user.id,
+        status: user.status 
+      }, 
+      jwtConfig.secret, 
+      { expiresIn: jwtConfig.expiresIn }
+    );
 
     res.status(201).json({
+      success: true,
       token,
       user: {
         id: user.id,
         name: user.name,
         phone: user.phone,
-        gender: user.gender,
-        referralCode: user.referral_code,
         status: user.status
-      }
+      },
+      nextStep: 'activation' // Frontend should redirect to activation
     });
-  } catch (err) {
-    next(err);
+
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error during registration'
+    });
   }
 };
 
-const login = async (req, res, next) => {
+// Enhanced login with status checking
+const login = async (req, res) => {
   try {
     const { phone, password } = req.body;
 
-    // Validate input
-    const { error } = validateLoginInput(req.body);
-    if (error) return res.status(400).json({ message: error.details[0].message });
-
-    // Check if user exists
-    const user = await userModel.findUserByPhone(phone);
-    if (!user) {
-      return res.status(400).json({ message: 'Invalid phone or password' });
+    // Basic validation
+    if (!phone || !password) {
+      return res.status(400).json({
+        success: false,
+        message: 'Phone and password are required'
+      });
     }
 
-    // Validate password
+    // Format phone
+    const formattedPhone = phone.startsWith('0') ? `254${phone.substring(1)}` : phone;
+
+    // Find user
+    const user = await userModel.findUserByPhone(formattedPhone);
+    if (!user) {
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials'
+      });
+    }
+
+    // Verify password
     const isMatch = await bcrypt.compare(password, user.password_hash);
     if (!isMatch) {
-      return res.status(400).json({ message: 'Invalid phone or password' });
+      return res.status(401).json({
+        success: false,
+        message: 'Invalid credentials'
+      });
+    }
+
+    // Check activation status
+    if (user.status !== 'active') {
+      return res.status(403).json({
+        success: false,
+        message: 'Account requires activation',
+        requiresActivation: true
+      });
     }
 
     // Generate token
-    const token = jwt.sign({ id: user.id }, jwtConfig.secret, { expiresIn: jwtConfig.expiresIn });
+    const token = jwt.sign(
+      { 
+        id: user.id,
+        status: user.status 
+      }, 
+      jwtConfig.secret, 
+      { expiresIn: jwtConfig.expiresIn }
+    );
 
     res.json({
+      success: true,
       token,
       user: {
         id: user.id,
         name: user.name,
         phone: user.phone,
-        gender: user.gender,
-        referralCode: user.referral_code,
         status: user.status
       }
     });
-  } catch (err) {
-    next(err);
+
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error during login'
+    });
   }
 };
 
