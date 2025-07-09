@@ -6,7 +6,39 @@ const balanceModel = require('./balanceModel');
 const transactionModel = require('./transactionModel');
 const { generateAccessToken, generateTimestamp } = require('./mpesaUtils');
 
-const initiateSTKPush = async (req, res, next) => {
+// Middleware to validate activation request
+const validateActivation = async (req, res, next) => {
+  try {
+    const { phone } = req.user;
+    
+    if (!phone) {
+      return res.status(400).json({ 
+        success: false,
+        message: 'Phone number is required' 
+      });
+    }
+
+    // Check if user is already active
+    const user = await userModel.findUserByPhone(phone);
+    if (user && user.status === 'active') {
+      return res.status(400).json({
+        success: false,
+        message: 'Account is already active'
+      });
+    }
+
+    next();
+  } catch (error) {
+    console.error('Activation validation error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Server error during validation'
+    });
+  }
+};
+
+// Initiate M-Pesa STK Push
+const initiateSTKPush = async (req, res) => {
   try {
     const { phone } = req.user;
     const amount = 100; // Ksh 100 activation fee
@@ -24,84 +56,187 @@ const initiateSTKPush = async (req, res, next) => {
       BusinessShortCode: mpesaConfig.businessShortCode,
       Password: password,
       Timestamp: timestamp,
-      TransactionType: mpesaConfig.transactionType,
+      TransactionType: 'CustomerPayBillOnline',
       Amount: amount,
       PartyA: `254${phone.substring(1)}`, // Convert to 254 format
       PartyB: mpesaConfig.businessShortCode,
       PhoneNumber: `254${phone.substring(1)}`,
-      CallBackURL: mpesaConfig.callbackURL,
-      AccountReference: mpesaConfig.accountReference,
-      TransactionDesc: mpesaConfig.transactionDesc,
+      CallBackURL: `${mpesaConfig.callbackBaseURL}/api/mpesa-callback`,
+      AccountReference: `ACTIVATION-${phone}`,
+      TransactionDesc: 'Account activation payment'
     };
 
     // Send STK push request
     const response = await axios.post(
-      'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest',
+      `${mpesaConfig.baseURL}/stkpush/v1/processrequest`,
       stkPushPayload,
       {
         headers: {
           Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json'
         },
       }
     );
 
     res.json({
-      message: 'STK Push initiated successfully. Please check your phone to complete payment.',
-      data: response.data,
+      success: true,
+      message: 'Payment request sent to your phone. Please complete the transaction.',
+      data: {
+        requestId: response.data.CheckoutRequestID,
+        phone: phone
+      }
     });
-  } catch (err) {
-    next(err);
+
+  } catch (error) {
+    console.error('STK Push initiation error:', error.response?.data || error.message);
+    res.status(500).json({
+      success: false,
+      message: 'Failed to initiate payment',
+      error: error.response?.data || error.message
+    });
   }
 };
 
-const handleMPesaCallback = async (req, res, next) => {
+// Handle M-Pesa callback
+const handleMPesaCallback = async (req, res) => {
   try {
     const callbackData = req.body;
 
-    // Check if payment was successful
-    if (callbackData.Body.stkCallback.ResultCode === 0) {
+    // Validate callback
+    if (!callbackData.Body?.stkCallback) {
+      return res.status(400).json({ 
+        success: false,
+        message: 'Invalid callback format' 
+      });
+    }
+
+    const resultCode = callbackData.Body.stkCallback.ResultCode;
+    
+    // Successful payment
+    if (resultCode === 0) {
       const metadata = callbackData.Body.stkCallback.CallbackMetadata.Item;
       const phone = metadata.find(item => item.Name === 'PhoneNumber').Value;
       const amount = metadata.find(item => item.Name === 'Amount').Value;
-      const mpesaReceiptNumber = metadata.find(item => item.Name === 'MpesaReceiptNumber').Value;
+      const receipt = metadata.find(item => item.Name === 'MpesaReceiptNumber').Value;
 
       // Convert phone to 07 format
       const formattedPhone = `0${phone.substring(3)}`;
 
       // Activate user
       const user = await userModel.activateUser(formattedPhone);
+      
+      if (!user) {
+        throw new Error('User not found');
+      }
 
-      // Update balance
+      // Record transaction
       await balanceModel.updateDepositBalance(user.id, amount);
       await transactionModel.createTransaction(
         user.id,
         'Account Activation',
         amount,
-        'deposit'
+        'deposit',
+        receipt
       );
 
       // Credit referrer if exists
       if (user.inviter_phone) {
-        const inviter = await userModel.findUserByPhone(user.inviter_phone);
-        if (inviter) {
-          const referralBonus = 100; // Ksh 100 for successful referral
-          await balanceModel.updateInviteEarnings(inviter.id, referralBonus);
-          await transactionModel.createTransaction(
-            inviter.id,
-            `Referral Bonus: ${user.phone}`,
-            referralBonus,
-            'invite'
-          );
-        }
+        const referralBonus = 100; // Ksh 100 referral bonus
+        await balanceModel.updateInviteEarnings(user.inviter_phone, referralBonus);
+        await transactionModel.createTransaction(
+          user.inviter_id,
+          `Referral Bonus: ${user.phone}`,
+          referralBonus,
+          'referral'
+        );
       }
 
-      return res.status(200).json({ message: 'Payment processed successfully' });
+      return res.status(200).json({ 
+        success: true,
+        message: 'Payment processed successfully' 
+      });
     }
 
-    res.status(400).json({ message: 'Payment failed or was cancelled' });
-  } catch (err) {
-    next(err);
+    // Failed payment
+    res.status(400).json({
+      success: false,
+      message: callbackData.Body.stkCallback.ResultDesc || 'Payment failed'
+    });
+
+  } catch (error) {
+    console.error('Callback processing error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error processing payment',
+      error: error.message
+    });
   }
 };
 
-module.exports = { initiateSTKPush, handleMPesaCallback };
+// Check activation status
+const checkActivationStatus = async (req, res) => {
+  try {
+    const { phone } = req.user;
+    const user = await userModel.findUserByPhone(phone);
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      activated: user.status === 'active',
+      status: user.status
+    });
+
+  } catch (error) {
+    console.error('Activation status check error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error checking activation status'
+    });
+  }
+};
+
+// Activate user (for testing or admin use)
+const activateUser = async (req, res) => {
+  try {
+    const { phone } = req.user;
+    const user = await userModel.activateUser(phone);
+
+    if (!user) {
+      return res.status(404).json({
+        success: false,
+        message: 'User not found'
+      });
+    }
+
+    res.json({
+      success: true,
+      message: 'Account activated successfully',
+      user: {
+        id: user.id,
+        phone: user.phone,
+        status: user.status
+      }
+    });
+
+  } catch (error) {
+    console.error('Manual activation error:', error);
+    res.status(500).json({
+      success: false,
+      message: 'Error activating account'
+    });
+  }
+};
+
+module.exports = {
+  validateActivation,
+  initiateSTKPush,
+  handleMPesaCallback,
+  checkActivationStatus,
+  activateUser
+};
